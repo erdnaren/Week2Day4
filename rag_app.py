@@ -1,393 +1,277 @@
 
-import os
-import hashlib
-from io import BytesIO
-from pathlib import Path
-
 import streamlit as st
+import os
+
 from dotenv import load_dotenv
 from pypdf import PdfReader
 
-from langchain_core.documents import Document
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+from langchain_classic.chains import create_history_aware_retriever
+from langchain_classic.chains import create_retrieval_chain
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import MessagesPlaceholder
+from langchain_core.messages import HumanMessage, AIMessage
 
 # --------------------------------------------------
-# 1. CONFIGURATION
+# 1. Configuration
 # --------------------------------------------------
 
 load_dotenv()
 
 st.set_page_config(
-    page_title="Multi-PDF RAG Assistant",
+    page_title="Conversational RAG Application",
     page_icon="📚",
     layout="wide"
 )
 
-st.title("📚 Multi-PDF RAG Assistant")
-st.caption(
-    "Upload multiple PDFs and ask questions across all "
-    "your documents."
-)
+st.title("📚 Conversational RAG Application")
+st.write("Upload PDF documents and ask multiple questions.")
 
-if not os.getenv("OPENAI_API_KEY"):
-    st.error("Please configure OPENAI_API_KEY in your .env file.")
+api_key = os.getenv("OPENAI_API_KEY")
+
+if not api_key:
+    st.error("OPENAI_API_KEY not found. Please configure your .env file.")
     st.stop()
 
-
 # --------------------------------------------------
-# 2. INITIALIZE MODELS
-# --------------------------------------------------
-
-@st.cache_resource
-def initialize_models():
-
-    embeddings = OpenAIEmbeddings(
-        model="text-embedding-3-small"
-    )
-
-    llm = ChatOpenAI(
-        model="gpt-4.1-mini",
-        temperature=0
-    )
-
-    return embeddings, llm
-
-
-embeddings, llm = initialize_models()
-
-
-# --------------------------------------------------
-# 3. EXTRACT TEXT FROM MULTIPLE PDFS
+# 2. Initialize LLM and Embeddings
 # --------------------------------------------------
 
-def extract_pdf_documents(uploaded_files):
+llm = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0
+)
 
-    documents = []
-    errors = []
-
-    for uploaded_file in uploaded_files:
-
-        try:
-            pdf_bytes = uploaded_file.getvalue()
-            reader = PdfReader(BytesIO(pdf_bytes))
-
-            for page_number, page in enumerate(
-                reader.pages, start=1
-            ):
-
-                text = page.extract_text() or ""
-
-                if not text.strip():
-                    continue
-
-                documents.append(
-                    Document(
-                        page_content=text,
-                        metadata={
-                            "source": uploaded_file.name,
-                            "page": page_number
-                        }
-                    )
-                )
-
-        except Exception as error:
-            errors.append(
-                f"{uploaded_file.name}: {str(error)}"
-            )
-
-    return documents, errors
-
+embeddings = OpenAIEmbeddings(
+    model="text-embedding-3-small"
+)
 
 # --------------------------------------------------
-# 4. SPLIT DOCUMENTS INTO CHUNKS
-# --------------------------------------------------
-
-def split_documents(documents):
-
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        separators=["\n\n", "\n", ".", " ", ""]
-    )
-
-    chunks = splitter.split_documents(documents)
-
-    return chunks
-
-
-# --------------------------------------------------
-# 5. CREATE ONE FAISS VECTOR DATABASE
-# --------------------------------------------------
-
-def create_vector_database(chunks):
-
-    vectorstore = FAISS.from_documents(
-        documents=chunks,
-        embedding=embeddings
-    )
-
-    return vectorstore
-
-
-# --------------------------------------------------
-# 6. QUESTION ANSWERING
-# --------------------------------------------------
-
-def answer_question(question, vectorstore):
-
-    # Retrieve relevant chunks from ALL PDFs
-    retrieved_docs = vectorstore.similarity_search(
-        question,
-        k=6
-    )
-
-    if not retrieved_docs:
-        return (
-            "I couldn't find relevant information in "
-            "the uploaded documents.",
-            []
-        )
-
-    # Build context with source identifiers
-    context_parts = []
-
-    for index, doc in enumerate(retrieved_docs, start=1):
-
-        source = doc.metadata.get("source", "Unknown")
-        page = doc.metadata.get("page", "Unknown")
-
-        context_parts.append(
-            f"""
-[SOURCE {index}]
-File: {source}
-Page: {page}
-
-Content:
-{doc.page_content}
-"""
-        )
-
-    context = "\n\n".join(context_parts)
-
-    prompt = f"""
-You are a precise document question-answering assistant.
-
-Answer the user's question using ONLY the supplied context.
-
-Rules:
-1. Do not invent facts or information.
-2. If the answer is not available in the context,
-   clearly say that the documents do not contain
-   enough information.
-3. Cite every factual claim using the source identifier.
-4. Use citations in this format: [SOURCE 1].
-5. When multiple sources support an answer, cite all
-   relevant sources.
-6. Distinguish conflicting information between documents.
-7. Never fabricate a filename or page number.
-
-DOCUMENT CONTEXT:
-{context}
-
-USER QUESTION:
-{question}
-
-ANSWER:
-"""
-
-    response = llm.invoke(prompt)
-
-    return response.content, retrieved_docs
-
-
-# --------------------------------------------------
-# 7. SESSION STATE
+# 3. Session State
 # --------------------------------------------------
 
 if "vectorstore" not in st.session_state:
     st.session_state.vectorstore = None
 
-if "processed_files" not in st.session_state:
-    st.session_state.processed_files = []
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
 
-if "file_signature" not in st.session_state:
-    st.session_state.file_signature = None
-
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
 # --------------------------------------------------
-# 8. SIDEBAR - PDF UPLOAD
+# 4. PDF Upload
 # --------------------------------------------------
 
-with st.sidebar:
+st.sidebar.header("Upload Documents")
 
-    st.header("📂 Document Upload")
+uploaded_files = st.sidebar.file_uploader(
+    "Upload PDF files",
+    type=["pdf"],
+    accept_multiple_files=True
+)
 
-    uploaded_files = st.file_uploader(
-        "Upload your PDF documents",
-        type=["pdf"],
-        accept_multiple_files="directory",
-        help="Select a folder containing PDFs, or upload "
-             "multiple PDFs."
-    )
+if st.sidebar.button("Process Documents"):
 
-    # Also allow selecting multiple PDFs individually.
-    # Streamlit's directory uploader accepts folders.
-    st.caption("You can select a folder or multiple PDF files.")
+    if uploaded_files:
 
-    if st.button(
-        "Process Documents",
-        type="primary",
-        use_container_width=True
-    ):
+        documents = []
 
-        if not uploaded_files:
-            st.warning("Please upload at least one PDF.")
+        for pdf in uploaded_files:
+
+            pdf_reader = PdfReader(pdf)
+
+            for page_number, page in enumerate(pdf_reader.pages):
+
+                text = page.extract_text()
+
+                if text:
+                    documents.append(
+                        Document(
+                            page_content=text,
+                            metadata={
+                                "source": pdf.name,
+                                "page": page_number + 1
+                            }
+                        )
+                    )
+
+        if not documents:
+            st.sidebar.error("No readable text found in PDFs.")
 
         else:
 
-            with st.spinner(
-                "Extracting, chunking and indexing documents..."
-            ):
+            # Split documents
+            splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000,
+                chunk_overlap=200
+            )
 
-                documents, errors = extract_pdf_documents(
-                    uploaded_files
-                )
+            chunks = splitter.split_documents(documents)
 
-                if errors:
-                    for error in errors:
-                        st.warning(error)
+            # Create FAISS vector store
+            st.session_state.vectorstore = (
+                FAISS.from_documents(chunks, embeddings)
+            )
 
-                if not documents:
-                    st.error(
-                        "No readable PDF text was found."
-                    )
+            # Reset previous conversation when documents change
+            st.session_state.chat_history = []
+            st.session_state.messages = []
 
-                else:
-
-                    chunks = split_documents(documents)
-
-                    vectorstore = create_vector_database(
-                        chunks
-                    )
-
-                    st.session_state.vectorstore = vectorstore
-
-                    st.session_state.processed_files = list(
-                        dict.fromkeys(
-                            doc.metadata["source"]
-                            for doc in documents
-                        )
-                    )
-
-                    st.session_state.file_signature = hashlib.sha256(
-                        b"".join(
-                            sorted(
-                                f.getvalue()
-                                for f in uploaded_files
-                            )
-                        )
-                    ).hexdigest()
-
-                    st.success("Documents indexed successfully!")
-
-                    st.info(
-                        f"""
-                        Files processed: {
-                            len(st.session_state.processed_files)
-                        }
-
-                        Pages extracted: {len(documents)}
-
-                        Chunks created: {len(chunks)}
-                        """
-                    )
-
-    st.divider()
-
-    st.subheader("📑 Indexed Documents")
-
-    if st.session_state.processed_files:
-
-        for filename in st.session_state.processed_files:
-            st.write(f"📄 {filename}")
+            st.sidebar.success(
+                f"Successfully processed {len(chunks)} chunks!"
+            )
 
     else:
-        st.caption("No documents indexed yet.")
-
+        st.sidebar.warning("Please upload PDF files.")
 
 # --------------------------------------------------
-# 9. MAIN CHAT INTERFACE
+# 5. Create Conversational RAG Chain
 # --------------------------------------------------
 
-st.subheader("💬 Ask Questions Across Your PDFs")
+def create_rag_chain(vectorstore):
+
+    retriever = vectorstore.as_retriever(
+        search_kwargs={"k": 4}
+    )
+
+    # Rewrite follow-up questions using chat history
+    contextualize_prompt = ChatPromptTemplate.from_messages([
+        (
+            "system",
+            "Given the conversation history and latest question, "
+            "rewrite the latest question as a standalone question. "
+            "Do not answer it."
+        ),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}")
+    ])
+
+    history_aware_retriever = create_history_aware_retriever(
+        llm,
+        retriever,
+        contextualize_prompt
+    )
+
+    # Answer using retrieved documents
+    qa_prompt = ChatPromptTemplate.from_messages([
+        (
+            "system",
+            """
+            You are a helpful AI assistant.
+
+            Answer the question using the retrieved context.
+
+            If the answer is not available in the context,
+            clearly say that the information is not available
+            in the uploaded documents.
+
+            Context:
+            {context}
+            """
+        ),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}")
+    ])
+
+    question_answer_chain = create_stuff_documents_chain(
+        llm,
+        qa_prompt
+    )
+
+    rag_chain = create_retrieval_chain(
+        history_aware_retriever,
+        question_answer_chain
+    )
+
+    return rag_chain
+
+# --------------------------------------------------
+# 6. Display Previous Conversations
+# --------------------------------------------------
+
+for message in st.session_state.messages:
+
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+# --------------------------------------------------
+# 7. Multiple Questions
+# --------------------------------------------------
 
 if st.session_state.vectorstore is None:
 
-    st.info(
-        "Upload your PDFs in the sidebar and click "
-        "'Process Documents' to get started."
-    )
+    st.info("👈 Upload and process PDF documents to start chatting.")
 
 else:
 
-    question = st.text_input(
-        "Enter your question",
-        placeholder="What are the key findings across these PDFs?"
+    rag_chain = create_rag_chain(
+        st.session_state.vectorstore
     )
 
-    if st.button("Get Answer", type="primary"):
+    question = st.chat_input(
+        "Ask your question about the uploaded documents..."
+    )
 
-        if not question.strip():
+    if question:
 
-            st.warning("Please enter a question.")
+        # Display user question
+        st.session_state.messages.append({
+            "role": "user",
+            "content": question
+        })
 
-        else:
+        with st.chat_message("user"):
+            st.markdown(question)
 
-            with st.spinner("Searching documents and generating answer..."):
+        # Generate response
+        with st.chat_message("assistant"):
 
-                answer, sources = answer_question(
-                    question,
-                    st.session_state.vectorstore
-                )
+            with st.spinner("Finding the answer..."):
 
-            st.markdown("### 📝 Answer")
-            st.markdown(answer)
+                try:
 
-            st.divider()
+                    response = rag_chain.invoke({
+                        "input": question,
+                        "chat_history": st.session_state.chat_history
+                    })
 
-            st.markdown("### 📚 Sources and References")
+                    answer = response["answer"]
 
-            seen = set()
+                    st.markdown(answer)
 
-            for index, doc in enumerate(sources, start=1):
+                    # Update conversation memory
+                    st.session_state.chat_history.extend([
+                        HumanMessage(content=question),
+                        AIMessage(content=answer)
+                    ])
 
-                filename = doc.metadata.get(
-                    "source", "Unknown"
-                )
+                    # Save conversation
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": answer
+                    })
 
-                page = doc.metadata.get(
-                    "page", "Unknown"
-                )
+                except Exception as e:
 
-                source_key = (filename, page, doc.page_content)
+                    st.error(f"Error generating answer: {e}")
 
-                if source_key in seen:
-                    continue
+# --------------------------------------------------
+# 8. Clear Chat
+# --------------------------------------------------
 
-                seen.add(source_key)
+if st.sidebar.button("🗑️ Clear Chat"):
 
-                with st.expander(
-                    f"📄 {filename} — Page {page}"
-                ):
+    st.session_state.messages = []
+    st.session_state.chat_history = []
 
-                    st.markdown(
-                        f"**Source ID:** SOURCE {index}"
-                    )
+    st.sidebar.success("Chat history cleared!")
 
-                    st.markdown("**Retrieved content:**")
-
-                    st.write(doc.page_content)
-
+    st.rerun()
